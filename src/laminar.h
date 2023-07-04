@@ -22,11 +22,11 @@
 #include "run.h"
 #include "monitorscope.h"
 #include "context.h"
-#include "database.h"
 
 #include <unordered_map>
 #include <kj/filesystem.h>
 #include <kj/async-io.h>
+#include <pqxx/pqxx>
 
 // Context name to context object map
 typedef std::unordered_map<std::string, std::shared_ptr<Context>> ContextMap;
@@ -42,6 +42,7 @@ struct Settings {
     const char* bind_rpc;
     const char* bind_http;
     const char* archive_url;
+    const char* connection_string;
 };
 
 // The main class implementing the application's business logic.
@@ -122,7 +123,7 @@ private:
     std::unordered_map<std::string, std::string> jobGroups;
 
     RunSet activeJobs;
-    Database* db;
+    pqxx::connection* conn;
     Server& srv;
     ContextMap contexts;
     kj::Path homePath;

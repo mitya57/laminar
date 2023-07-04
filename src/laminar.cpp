@@ -31,6 +31,7 @@
 #include <fnmatch.h>
 #include <fstream>
 #include <zlib.h>
+#include <time.h>
 
 #define COMPRESS_LOG_MIN_SIZE 1024
 
@@ -72,6 +73,16 @@ inline kj::Path operator/(const std::string& p, const T& ext) {
 
 typedef std::string str;
 
+inline time_t to_time_t(const pqxx::field &field)
+{
+    /* TODO: Implement a converter from/to struct tm for libpqxx? */
+    if (field.is_null())
+        return 0;
+    struct tm tm;
+    strptime(field.c_str(), "%Y-%m-%d %H:%M:%S", &tm);
+    return mktime(&tm);
+}
+
 Laminar::Laminar(Server &server, Settings settings) :
     srv(server),
     homePath(kj::Path::parse(&settings.home[1])),
@@ -92,42 +103,14 @@ Laminar::Laminar(Server &server, Settings settings) :
 
     numKeepRunDirs = 0;
 
-    db = new Database((homePath/"laminar.sqlite").toString(true).cStr());
-    // Prepare database for first use
-    // TODO: error handling
-    const char *create_table_stmt =
-        "CREATE TABLE IF NOT EXISTS builds("
-        "name TEXT, number INT UNSIGNED, node TEXT, queuedAt INT, "
-        "startedAt INT, completedAt INT, result INT, output TEXT, "
-        "outputLen INT, parentJob TEXT, parentBuild INT, reason TEXT, "
-        "PRIMARY KEY (name, number DESC))";
-    db->exec(create_table_stmt);
-
-    // Migrate from (name, number) primary key to (name, number DESC).
-    // SQLite does not allow to alter primary key of existing table, so
-    // we have to create a new table.
-    db->stmt("SELECT sql LIKE '%, PRIMARY KEY (name, number))' "
-             "FROM sqlite_master WHERE type = 'table' AND name = 'builds'")
-    .fetch<int>([&](int has_old_index) {
-        if (has_old_index) {
-            LLOG(INFO, "Migrating table to the new primary key");
-            db->exec("BEGIN TRANSACTION");
-            db->exec("ALTER TABLE builds RENAME TO builds_old");
-            db->exec(create_table_stmt);
-            db->exec("INSERT INTO builds SELECT * FROM builds_old");
-            db->exec("DROP TABLE builds_old");
-            db->exec("COMMIT");
-        }
-    });
-
-    db->exec("CREATE INDEX IF NOT EXISTS idx_completion_time ON builds("
-             "completedAt DESC)");
+    conn = pqxx::connection(settings.connection_string.cStr());
 
     // retrieve the last build numbers
-    db->stmt("SELECT name, MAX(number) FROM builds GROUP BY name")
-    .fetch<str,uint>([this](str name, uint build){
+    pqxx::work tx{conn};
+    str stmt = "SELECT name, MAX(number) FROM builds GROUP BY name";
+    for (auto [name, build] : tx.query<str, uint>(stmt)) {
         buildNums[name] = build;
-    });
+    }
 
     srv.watchPaths([this]{
         LLOG(INFO, "Reloading configuration");
@@ -172,21 +155,23 @@ bool Laminar::handleLogRequest(std::string name, uint num, std::string& output, 
         complete = false;
         return true;
     } else { // it must be finished, fetch it from the database
-        db->stmt("SELECT output, outputLen FROM builds WHERE name = ? AND number = ?")
-                .bind(name, num)
-                .fetch<str,int>([&](str maybeZipped, unsigned long sz) {
-            str log(sz,'\0');
-            if(sz >= COMPRESS_LOG_MIN_SIZE) {
-                int res = ::uncompress((uint8_t*) log.data(), &sz,
-                                       (const uint8_t*) maybeZipped.data(), maybeZipped.size());
-                if(res == Z_OK)
-                    std::swap(output, log);
-                else
-                    LLOG(ERROR, "Failed to uncompress log", res);
-            } else {
-                std::swap(output, maybeZipped);
-            }
-        });
+        pqxx::work tx{conn};
+        str stmt = "SELECT output, outputLen FROM builds WHERE name = $1 AND number = $2";
+        auto row = tx.exec_params1(stmt, name, num);
+        unsigned long sz = row["outputLen"].as<unsigned long>();
+        auto maybeZipped = row["output"].as<std::basic_string<std::byte>>();
+        str log(sz,'\0');
+        if(sz >= COMPRESS_LOG_MIN_SIZE) {
+            int res = ::uncompress((uint8_t*) log.data(), &sz,
+                                   (const uint8_t*) maybeZipped.data(), maybeZipped.size());
+            if(res == Z_OK)
+                std::swap(output, log);
+            else
+                LLOG(ERROR, "Failed to uncompress log", res);
+        } else {
+            /* TODO: Can we avoid a copy here? */
+            output = str(static_cast<char*>(maybeZipped.c_str()));
+        }
         if(output.size()) {
             complete = true;
             return true;
@@ -249,22 +234,24 @@ std::string Laminar::getStatus(MonitorScope scope) {
     j.set("version", laminar_version());
     j.set("time", time(nullptr));
     j.startObject("data");
+    pqxx::work tx{conn};
+    str stmt;
+    pqxx::row row;
     if(scope.type == MonitorScope::RUN) {
-        db->stmt("SELECT queuedAt,startedAt,completedAt,result,reason,parentJob,parentBuild,q.lr IS NOT NULL,q.lr FROM builds "
-                 "LEFT JOIN (SELECT name n, MAX(number), completedAt-startedAt lr FROM builds WHERE result IS NOT NULL GROUP BY n) q ON q.n = name "
-                 "WHERE name = ? AND number = ?")
-        .bind(scope.job, scope.num)
-        .fetch<time_t, time_t, time_t, int, std::string, std::string, uint, uint, uint>([&](time_t queued, time_t started, time_t completed, int result, std::string reason, std::string parentJob, uint parentBuild, uint lastRuntimeKnown, uint lastRuntime) {
-            j.set("queued", queued);
-            j.set("started", started);
-            if(completed)
-              j.set("completed", completed);
-            j.set("result", to_string(completed ? RunState(result) : started ? RunState::RUNNING : RunState::QUEUED));
-            j.set("reason", reason);
-            j.startObject("upstream").set("name", parentJob).set("num", parentBuild).EndObject(2);
-            if(lastRuntimeKnown)
-              j.set("etc", started + lastRuntime);
-        });
+        stmt = "SELECT queuedAt,startedAt,completedAt,result,reason,parentJob,parentBuild,startedAt+q.lr AS expectedFinish FROM builds "
+               "LEFT JOIN (SELECT name n, MAX(number), completedAt-startedAt lr FROM builds WHERE result IS NOT NULL GROUP BY n) q ON q.n = name "
+               "WHERE name = $1 AND number = $2";
+        row = tx.exec_params1(stmt, scope.job, scope.num);
+        j.set("queued", to_time_t(row["queuedAt"]));
+        j.set("started", to_time_t(row["startedAt"]));
+        if(!row["completedAt"].is_null())
+            j.set("completed", to_time_t(row["completedAt"]));
+        int result = row["result"].as<int>();
+        j.set("result", to_string(completed ? RunState(result) : !row["startedAt"].is_null() ? RunState::RUNNING : RunState::QUEUED));
+        j.set("reason", row["reason"].as<str>());
+        j.startObject("upstream").set("name", row["parentJob"].as<str>()).set("num", row["parentBuild"].as<uint>()).EndObject(2);
+        if(!row["expectedFinish"].is_null())
+            j.set("etc", to_time_t(row["expectedFinish"]));
         if(auto it = buildNums.find(scope.job); it != buildNums.end())
             j.set("latestNum", int(it->second));
 
@@ -288,31 +275,27 @@ std::string Laminar::getStatus(MonitorScope scope) {
         else
             order_by = "number DESC";
         std::string stmt = "SELECT number,startedAt,completedAt,result,reason FROM builds "
-                "WHERE name = ? AND result IS NOT NULL ORDER BY "
-                + order_by + " LIMIT ?,?";
-        db->stmt(stmt.c_str())
-        .bind(scope.job, scope.page * runsPerPage, runsPerPage)
-        .fetch<uint,time_t,time_t,int,str>([&](uint build,time_t started,time_t completed,int result,str reason){
+                "WHERE name = $1 AND result IS NOT NULL ORDER BY "
+                + order_by + " LIMIT $2 OFFSET $3";
+        for (auto row : tx.exec_params(stmt, scope.job, runsPerPage, scope.page * runsPerPage)) {
             j.StartObject();
-            j.set("number", build)
-             .set("completed", completed)
-             .set("started", started)
-             .set("result", to_string(RunState(result)))
-             .set("reason", reason)
+            j.set("number", row["number"].as<uint>())
+             .set("completed", to_time_t(row["completedAt"]))
+             .set("started", to_time_t(row["startedAt"]))
+             .set("result", to_string(RunState(row["result"].as<int>())))
+             .set("reason", row["reason"].as<str>())
              .EndObject();
-        });
+        }
         j.EndArray();
-        db->stmt("SELECT COUNT(*),AVG(completedAt-startedAt) FROM builds WHERE name = ? AND result IS NOT NULL")
-        .bind(scope.job)
-        .fetch<uint,uint>([&](uint nRuns, uint averageRuntime){
-            j.set("averageRuntime", averageRuntime);
-            j.set("pages", (nRuns-1) / runsPerPage + 1);
-            j.startObject("sort");
-            j.set("page", scope.page)
-             .set("field", scope.field)
-             .set("order", scope.order_desc ? "dsc" : "asc")
-             .EndObject();
-        });
+        stmt = "SELECT COUNT(*),AVG(completedAt-startedAt) FROM builds WHERE name = $1 AND result IS NOT NULL";
+        row = tx.exec_params1(stmt, scope.job);
+        j.set("averageRuntime", row[1].as<uint>());
+        j.set("pages", (row[0].as<uint>() - 1) / runsPerPage + 1);
+        j.startObject("sort");
+        j.set("page", scope.page)
+         .set("field", scope.field)
+         .set("order", scope.order_desc ? "dsc" : "asc")
+         .EndObject();
         j.startArray("running");
         auto p = activeJobs.byJobName().equal_range(scope.job);
         for(auto it = p.first; it != p.second; ++it) {
@@ -337,39 +320,37 @@ std::string Laminar::getStatus(MonitorScope scope) {
             }
         }
         j.EndArray();
-        db->stmt("SELECT number,startedAt FROM builds WHERE name = ? AND result = ? "
-                 "ORDER BY completedAt DESC LIMIT 1")
-        .bind(scope.job, int(RunState::SUCCESS))
-        .fetch<int,time_t>([&](int build, time_t started){
-            j.startObject("lastSuccess");
-            j.set("number", build).set("started", started);
-            j.EndObject();
-        });
-        db->stmt("SELECT number,startedAt FROM builds "
-                 "WHERE name = ? AND result <> ? "
-                 "ORDER BY completedAt DESC LIMIT 1")
-        .bind(scope.job, int(RunState::SUCCESS))
-        .fetch<int,time_t>([&](int build, time_t started){
-            j.startObject("lastFailed");
-            j.set("number", build).set("started", started);
-            j.EndObject();
-        });
+        stmt = "SELECT number,startedAt FROM builds WHERE name = $1 AND result = $2 "
+               "ORDER BY completedAt DESC LIMIT 1";
+        row = tx.exec_params1(stmt, scope.job, int(RunState::SUCCESS));
+        j.startObject("lastSuccess");
+        j.set("number", row["number"].as<int>())
+         .set("started", to_time_t(row["startedAt"]));
+        j.EndObject();
+        stmt = "SELECT number,startedAt FROM builds "
+               "WHERE name = $1 AND result <> $2 "
+               "ORDER BY completedAt DESC LIMIT 1";
+        row = tx.exec_params1(stmt, scope.job, int(RunState::SUCCESS));
+        j.startObject("lastFailed");
+        j.set("number", row["number"].as<int>())
+         .set("started", to_time_t(row["startedAt"]));
+        j.EndObject();
         auto desc = jobDescriptions.find(scope.job);
         j.set("description", desc == jobDescriptions.end() ? "" : desc->second);
     } else if(scope.type == MonitorScope::ALL) {
         j.startArray("jobs");
-        db->stmt("SELECT name, number, startedAt, completedAt, result, reason "
-                 "FROM builds GROUP BY name HAVING number = MAX(number)")
-        .fetch<str,uint,time_t,time_t,int,str>([&](str name,uint number, time_t started, time_t completed, int result, str reason){
+        stmt = "SELECT name, number, startedAt, completedAt, result, reason "
+               "FROM builds GROUP BY name HAVING number = MAX(number)";
+        for (row : tx.exec(stmt)) {
             j.StartObject();
-            j.set("name", name);
-            j.set("number", number);
-            j.set("result", to_string(RunState(result)));
-            j.set("started", started);
-            j.set("completed", completed);
-            j.set("reason", reason);
+            j.set("name", row["name"].as<str>());
+            j.set("number", row["number"].as<uint>());
+            j.set("result", row["result"].as<int>());
+            j.set("started", to_time_t(row["startedAt"]));
+            j.set("completed", to_time_t(row["completedAt"]));
+            j.set("reason", row["reason"].as<str>());
             j.EndObject();
-        });
+        }
         j.EndArray();
         j.startArray("running");
         for(const auto& run : activeJobs.byStartedAt()) {
