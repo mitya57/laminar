@@ -92,40 +92,31 @@ Laminar::Laminar(Server &server, Settings settings) :
 
     numKeepRunDirs = 0;
 
-    db = new Database((homePath/"laminar.sqlite").toString(true).cStr());
+    conn = new pqxx::connection(settings.connection_string);
+    pqxx::nontransaction tx(*conn);
+
     // Prepare database for first use
     // TODO: error handling
-    const char *create_table_stmt =
-        "CREATE TABLE IF NOT EXISTS builds("
-        "name TEXT, number INT UNSIGNED, node TEXT, queuedAt INT, "
-        "startedAt INT, completedAt INT, result INT, output TEXT, "
-        "outputLen INT, parentJob TEXT, parentBuild INT, reason TEXT, "
-        "PRIMARY KEY (name, number DESC))";
-    db->exec(create_table_stmt);
+    tx.exec("CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\"");
 
-    // Migrate from (name, number) primary key to (name, number DESC).
-    // SQLite does not allow to alter primary key of existing table, so
-    // we have to create a new table.
-    db->stmt("SELECT sql LIKE '%, PRIMARY KEY (name, number))' "
-             "FROM sqlite_master WHERE type = 'table' AND name = 'builds'")
-    .fetch<int>([&](int has_old_index) {
-        if (has_old_index) {
-            LLOG(INFO, "Migrating table to the new primary key");
-            db->exec("BEGIN TRANSACTION");
-            db->exec("ALTER TABLE builds RENAME TO builds_old");
-            db->exec(create_table_stmt);
-            db->exec("INSERT INTO builds SELECT * FROM builds_old");
-            db->exec("DROP TABLE builds_old");
-            db->exec("COMMIT");
-        }
-    });
+    tx.exec("CREATE TABLE IF NOT EXISTS builds("
+            // Fixed-width columns come first
+            "guid UUID DEFAULT uuid_generate_v4(), number BIGINT NOT NULL, "
+            "queuedAt BIGINT NOT NULL, startedAt BIGINT, completedAt BIGINT, "
+            "result INT, outputLen BIGINT, parentBuild BIGINT, "
+            // And then text/bytea fields
+            "name TEXT NOT NULL, node TEXT, output BYTEA, parentJob TEXT, "
+            "reason TEXT, PRIMARY KEY (guid))");
 
-    db->exec("CREATE INDEX IF NOT EXISTS idx_completion_time ON builds("
-             "completedAt DESC)");
+    tx.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_name_number ON builds("
+            "name, number DESC)");
+
+    tx.exec("CREATE INDEX IF NOT EXISTS idx_completion_time ON builds("
+            "completedAt DESC)");
 
     // retrieve the last build numbers
-    db->stmt("SELECT name, MAX(number) FROM builds GROUP BY name")
-    .fetch<str,uint>([this](str name, uint build){
+    tx.exec("SELECT name, MAX(number) FROM builds GROUP BY name")
+    .for_each([this](str name, uint build){
         buildNums[name] = build;
     });
 
@@ -172,9 +163,10 @@ bool Laminar::handleLogRequest(std::string name, uint num, std::string& output, 
         complete = false;
         return true;
     } else { // it must be finished, fetch it from the database
-        db->stmt("SELECT output, outputLen FROM builds WHERE name = ? AND number = ?")
-                .bind(name, num)
-                .fetch<str,int>([&](str maybeZipped, unsigned long sz) {
+        pqxx::nontransaction tx(*conn);
+        tx.exec_params("SELECT output, outputLen FROM builds WHERE name = $1 AND number = $2",
+                       name, num)
+        .for_each([&](std::basic_string<std::byte> maybeZipped, unsigned long sz) {
             str log(sz,'\0');
             if(sz >= COMPRESS_LOG_MIN_SIZE) {
                 int res = ::uncompress((uint8_t*) log.data(), &sz,
@@ -184,7 +176,8 @@ bool Laminar::handleLogRequest(std::string name, uint num, std::string& output, 
                 else
                     LLOG(ERROR, "Failed to uncompress log", res);
             } else {
-                std::swap(output, maybeZipped);
+                // TODO: Can we avoid a copy here?
+                output = str(reinterpret_cast<const char*>(maybeZipped.c_str()));
             }
         });
         if(output.size()) {
@@ -249,12 +242,13 @@ std::string Laminar::getStatus(MonitorScope scope) {
     j.set("version", laminar_version());
     j.set("time", time(nullptr));
     j.startObject("data");
+    pqxx::nontransaction tx(*conn);
     if(scope.type == MonitorScope::RUN) {
-        db->stmt("SELECT queuedAt,startedAt,completedAt,result,reason,parentJob,parentBuild,q.lr IS NOT NULL,q.lr FROM builds "
-                 "LEFT JOIN (SELECT name n, MAX(number), completedAt-startedAt lr FROM builds WHERE result IS NOT NULL GROUP BY n) q ON q.n = name "
-                 "WHERE name = ? AND number = ?")
-        .bind(scope.job, scope.num)
-        .fetch<time_t, time_t, time_t, int, std::string, std::string, uint, uint, uint>([&](time_t queued, time_t started, time_t completed, int result, std::string reason, std::string parentJob, uint parentBuild, uint lastRuntimeKnown, uint lastRuntime) {
+        tx.exec_params("SELECT queuedAt,startedAt,completedAt,result,reason,parentJob,parentBuild,q.lr IS NOT NULL,q.lr FROM builds "
+                       "LEFT JOIN (SELECT DISTINCT ON (name) name n, completedAt-startedAt lr FROM builds WHERE result IS NOT NULL ORDER BY name, number DESC) q ON q.n = name "
+                       "WHERE name = $1 AND number = $2",
+                       scope.job, scope.num)
+        .for_each([&](time_t queued, time_t started, time_t completed, int result, std::string reason, std::string parentJob, uint parentBuild, uint lastRuntimeKnown, uint lastRuntime) {
             j.set("queued", queued);
             j.set("started", started);
             if(completed)
@@ -288,11 +282,10 @@ std::string Laminar::getStatus(MonitorScope scope) {
         else
             order_by = "number DESC";
         std::string stmt = "SELECT number,startedAt,completedAt,result,reason FROM builds "
-                "WHERE name = ? AND result IS NOT NULL ORDER BY "
-                + order_by + " LIMIT ?,?";
-        db->stmt(stmt.c_str())
-        .bind(scope.job, scope.page * runsPerPage, runsPerPage)
-        .fetch<uint,time_t,time_t,int,str>([&](uint build,time_t started,time_t completed,int result,str reason){
+                "WHERE name = $1 AND result IS NOT NULL ORDER BY "
+                + order_by + " LIMIT $2 OFFSET $3";
+        tx.exec_params(stmt, scope.job, runsPerPage, scope.page * runsPerPage)
+        .for_each([&](uint build,time_t started,time_t completed,int result,str reason){
             j.StartObject();
             j.set("number", build)
              .set("completed", completed)
@@ -302,9 +295,9 @@ std::string Laminar::getStatus(MonitorScope scope) {
              .EndObject();
         });
         j.EndArray();
-        db->stmt("SELECT COUNT(*),AVG(completedAt-startedAt) FROM builds WHERE name = ? AND result IS NOT NULL")
-        .bind(scope.job)
-        .fetch<uint,uint>([&](uint nRuns, uint averageRuntime){
+        tx.exec_params("SELECT COUNT(*),CAST(AVG(completedAt-startedAt) AS INT) FROM builds WHERE name = $1 AND result IS NOT NULL",
+                       scope.job)
+        .for_each([&](uint nRuns, uint averageRuntime){
             j.set("averageRuntime", averageRuntime);
             j.set("pages", (nRuns-1) / runsPerPage + 1);
             j.startObject("sort");
@@ -337,19 +330,19 @@ std::string Laminar::getStatus(MonitorScope scope) {
             }
         }
         j.EndArray();
-        db->stmt("SELECT number,startedAt FROM builds WHERE name = ? AND result = ? "
-                 "ORDER BY completedAt DESC LIMIT 1")
-        .bind(scope.job, int(RunState::SUCCESS))
-        .fetch<int,time_t>([&](int build, time_t started){
+        tx.exec_params("SELECT number,startedAt FROM builds WHERE name = $1 AND result = $2 "
+                       "ORDER BY completedAt DESC LIMIT 1",
+                       scope.job, int(RunState::SUCCESS))
+        .for_each([&](int build, time_t started){
             j.startObject("lastSuccess");
             j.set("number", build).set("started", started);
             j.EndObject();
         });
-        db->stmt("SELECT number,startedAt FROM builds "
-                 "WHERE name = ? AND result <> ? "
-                 "ORDER BY completedAt DESC LIMIT 1")
-        .bind(scope.job, int(RunState::SUCCESS))
-        .fetch<int,time_t>([&](int build, time_t started){
+        tx.exec_params("SELECT number,startedAt FROM builds "
+                       "WHERE name = $1 AND result <> $2 "
+                       "ORDER BY completedAt DESC LIMIT 1",
+                       scope.job, int(RunState::SUCCESS))
+        .for_each([&](int build, time_t started){
             j.startObject("lastFailed");
             j.set("number", build).set("started", started);
             j.EndObject();
@@ -358,9 +351,9 @@ std::string Laminar::getStatus(MonitorScope scope) {
         j.set("description", desc == jobDescriptions.end() ? "" : desc->second);
     } else if(scope.type == MonitorScope::ALL) {
         j.startArray("jobs");
-        db->stmt("SELECT name, number, startedAt, completedAt, result, reason "
-                 "FROM builds GROUP BY name HAVING number = MAX(number)")
-        .fetch<str,uint,time_t,time_t,int,str>([&](str name,uint number, time_t started, time_t completed, int result, str reason){
+        tx.exec("SELECT DISTINCT ON (name) name, number, startedAt, completedAt, result, reason "
+                "FROM builds ORDER BY name, number DESC")
+        .for_each([&](str name,uint number, time_t started, time_t completed, int result, str reason){
             j.StartObject();
             j.set("name", name);
             j.set("number", number);
@@ -387,8 +380,8 @@ std::string Laminar::getStatus(MonitorScope scope) {
         j.EndObject();
     } else { // Home page
         j.startArray("recent");
-        db->stmt("SELECT name,number,node,queuedAt,startedAt,completedAt,result,reason FROM builds WHERE completedAt IS NOT NULL ORDER BY completedAt DESC LIMIT 20")
-        .fetch<str,uint,str,time_t,time_t,time_t,int,str>([&](str name,uint build,str context,time_t queued,time_t started,time_t completed,int result,str reason){
+        tx.exec("SELECT name,number,node,queuedAt,startedAt,completedAt,result,reason FROM builds WHERE completedAt IS NOT NULL ORDER BY completedAt DESC LIMIT 20")
+        .for_each([&](str name,uint build,str context,time_t queued,time_t started,time_t completed,int result,str reason){
             j.StartObject();
             j.set("name", name)
              .set("number", build)
@@ -408,11 +401,11 @@ std::string Laminar::getStatus(MonitorScope scope) {
             j.set("number", run->build);
             j.set("context", run->context->name);
             j.set("started", run->startedAt);
-            db->stmt("SELECT completedAt - startedAt FROM builds "
-                     "WHERE completedAt IS NOT NULL AND name = ? "
-                     "ORDER BY completedAt DESC LIMIT 1")
-             .bind(run->name)
-             .fetch<uint>([&](uint lastRuntime){
+            tx.exec_params("SELECT completedAt - startedAt FROM builds "
+                           "WHERE completedAt IS NOT NULL AND name = $1 "
+                           "ORDER BY completedAt DESC LIMIT 1",
+                           run->name)
+            .for_each([&](uint lastRuntime){
                 j.set("etc", run->startedAt + lastRuntime);
             });
             j.EndObject();
@@ -439,32 +432,32 @@ std::string Laminar::getStatus(MonitorScope scope) {
         j.startArray("buildsPerDay");
         for(int i = 6; i >= 0; --i) {
             j.StartObject();
-            db->stmt("SELECT result, COUNT(*) FROM builds WHERE completedAt > ? AND completedAt < ? GROUP BY result")
-                    .bind(86400*(time(nullptr)/86400 - i), 86400*(time(nullptr)/86400 - (i-1)))
-                    .fetch<int,int>([&](int result, int num){
+            tx.exec_params("SELECT result, COUNT(*) FROM builds WHERE completedAt > $1 AND completedAt < $2 GROUP BY result",
+                    86400*(time(nullptr)/86400 - i), 86400*(time(nullptr)/86400 - (i-1)))
+            .for_each([&](int result, int num){
                 j.set(to_string(RunState(result)).c_str(), num);
             });
             j.EndObject();
         }
         j.EndArray();
         j.startObject("buildsPerJob");
-        db->stmt("SELECT name, COUNT(*) c FROM builds WHERE completedAt > ? GROUP BY name ORDER BY c DESC LIMIT 5")
-                .bind(time(nullptr) - 86400)
-                .fetch<str, int>([&](str job, int count){
+        tx.exec_params("SELECT name, COUNT(*) c FROM builds WHERE completedAt > $1 GROUP BY name ORDER BY c DESC LIMIT 5",
+                       time(nullptr) - 86400)
+        .for_each([&](str job, int count){
             j.set(job.c_str(), count);
         });
         j.EndObject();
         j.startObject("timePerJob");
-        db->stmt("SELECT name, AVG(completedAt-startedAt) av FROM builds WHERE completedAt > ? GROUP BY name ORDER BY av DESC LIMIT 8")
-                .bind(time(nullptr) - 7 * 86400)
-                .fetch<str, double>([&](str job, double time){
+        tx.exec_params("SELECT name, AVG(completedAt-startedAt) av FROM builds WHERE completedAt > $1 GROUP BY name ORDER BY av DESC LIMIT 8",
+                       time(nullptr) - 7 * 86400)
+        .for_each([&](str job, double time){
             j.set(job.c_str(), time);
         });
         j.EndObject();
         j.startArray("resultChanged");
-        db->stmt("SELECT b.name,MAX(b.number) as lastSuccess,lastFailure FROM builds AS b JOIN (SELECT name,MAX(number) AS lastFailure FROM builds WHERE result<>? GROUP BY name) AS t ON t.name=b.name WHERE b.result=? GROUP BY b.name ORDER BY lastSuccess>lastFailure, lastFailure-lastSuccess DESC LIMIT 8")
-                .bind(int(RunState::SUCCESS), int(RunState::SUCCESS))
-                .fetch<str, uint, uint>([&](str job, uint lastSuccess, uint lastFailure){
+        tx.exec_params("SELECT b.name,MAX(b.number) as lastSuccess,lastFailure FROM builds AS b JOIN (SELECT name,MAX(number) AS lastFailure FROM builds WHERE result<>$1 GROUP BY name) AS t ON t.name=b.name WHERE b.result=$2 GROUP BY b.name, lastFailure ORDER BY MAX(b.number)>lastFailure, lastFailure-MAX(b.number) DESC LIMIT 8",
+                       int(RunState::SUCCESS), int(RunState::SUCCESS))
+        .for_each([&](str job, uint lastSuccess, uint lastFailure){
             j.StartObject();
             j.set("name", job)
              .set("lastSuccess", lastSuccess)
@@ -473,17 +466,17 @@ std::string Laminar::getStatus(MonitorScope scope) {
         });
         j.EndArray();
         j.startArray("lowPassRates");
-        db->stmt("SELECT name,CAST(SUM(result==?) AS FLOAT)/COUNT(*) AS passRate FROM builds GROUP BY name ORDER BY passRate ASC LIMIT 8")
-                .bind(int(RunState::SUCCESS))
-                .fetch<str, double>([&](str job, double passRate){
+        tx.exec_params("SELECT name,CAST(COUNT(1) FILTER (WHERE result=$1) AS FLOAT)/COUNT(*) AS passRate FROM builds GROUP BY name ORDER BY passRate ASC LIMIT 8",
+                       int(RunState::SUCCESS))
+        .for_each([&](str job, double passRate){
             j.StartObject();
             j.set("name", job).set("passRate", passRate);
             j.EndObject();
         });
         j.EndArray();
         j.startArray("buildTimeChanges");
-        db->stmt("SELECT name,GROUP_CONCAT(number),GROUP_CONCAT(completedAt-startedAt) FROM builds WHERE number > (SELECT MAX(number)-10 FROM builds b WHERE b.name=builds.name) GROUP BY name ORDER BY (MAX(completedAt-startedAt)-MIN(completedAt-startedAt))-STDEV(completedAt-startedAt) DESC LIMIT 8")
-                .fetch<str,str,str>([&](str name, str numbers, str durations){
+        tx.exec("SELECT name, STRING_AGG(CAST(number AS TEXT),','), STRING_AGG(CAST(completedAt-startedAt AS TEXT),',') FROM builds WHERE number > (SELECT MAX(number)-10 FROM builds b WHERE b.name=builds.name) GROUP BY name ORDER BY (MAX(completedAt-startedAt)-MIN(completedAt-startedAt))-STDDEV(completedAt-startedAt) DESC LIMIT 8")
+        .for_each([&](str name, str numbers, str durations){
             j.StartObject();
             j.set("name", name);
             j.startArray("numbers");
@@ -496,8 +489,8 @@ std::string Laminar::getStatus(MonitorScope scope) {
         });
         j.EndArray();
         j.startObject("completedCounts");
-        db->stmt("SELECT name, COUNT(*) FROM builds WHERE result IS NOT NULL GROUP BY name")
-                .fetch<str, uint>([&](str job, uint count){
+        tx.exec("SELECT name, COUNT(*) FROM builds WHERE result IS NOT NULL GROUP BY name")
+        .for_each([&](str job, uint count){
             j.set(job.c_str(), count);
         });
         j.EndObject();
@@ -507,7 +500,7 @@ std::string Laminar::getStatus(MonitorScope scope) {
 }
 
 Laminar::~Laminar() noexcept try {
-    delete db;
+    delete conn;
 } catch (std::exception& e) {
     LLOG(ERROR, e.what());
     return;
@@ -620,9 +613,9 @@ std::shared_ptr<Run> Laminar::queueJob(std::string name, ParamMap params, bool f
     else
         queuedJobs.push_back(run);
 
-    db->stmt("INSERT INTO builds(name,number,queuedAt,parentJob,parentBuild,reason) VALUES(?,?,?,?,?,?)")
-     .bind(run->name, run->build, run->queuedAt, run->parentName, run->parentBuild, run->reason())
-     .exec();
+    pqxx::nontransaction tx(*conn);
+    tx.exec_params("INSERT INTO builds(name,number,queuedAt,parentJob,parentBuild,reason) VALUES($1,$2,$3,$4,$5,$6)",
+                   run->name, run->build, run->queuedAt, run->parentName, run->parentBuild, run->reason());
 
     // notify clients
     Json j;
@@ -672,6 +665,7 @@ bool Laminar::canQueue(const Context& ctx, const Run& run) const {
 }
 
 bool Laminar::tryStartRun(std::shared_ptr<Run> run, int queueIndex) {
+    pqxx::nontransaction tx(*conn);
     for(auto& sc : contexts) {
         std::shared_ptr<Context> ctx = sc.second;
 
@@ -680,17 +674,16 @@ bool Laminar::tryStartRun(std::shared_ptr<Run> run, int queueIndex) {
 
             // set the last known result if exists. Runs which haven't started yet should
             // have completedAt == NULL and thus be at the end of a DESC ordered query
-            db->stmt("SELECT result FROM builds WHERE name = ? ORDER BY completedAt DESC LIMIT 1")
-             .bind(run->name)
-             .fetch<int>([&](int result){
+            tx.exec_params("SELECT result FROM builds WHERE name = $1 ORDER BY completedAt DESC LIMIT 1",
+                           run->name)
+            .for_each([&](int result){
                 lastResult = RunState(result);
             });
 
             kj::Promise<RunState> onRunFinished = run->start(lastResult, ctx, *fsHome,[this](kj::Maybe<pid_t>& pid){return srv.onChildExit(pid);});
 
-            db->stmt("UPDATE builds SET node = ?, startedAt = ? WHERE name = ? AND number = ?")
-             .bind(ctx->name, run->startedAt, run->name, run->build)
-             .exec();
+            tx.exec_params("UPDATE builds SET node = $1, startedAt = $2 WHERE name = $3 AND number = $4",
+                           ctx->name, run->startedAt, run->name, run->build);
 
             ctx->busyExecutors++;
 
@@ -723,9 +716,9 @@ bool Laminar::tryStartRun(std::shared_ptr<Run> run, int queueIndex) {
              .set("started", run->startedAt)
              .set("number", run->build)
              .set("reason", run->reason());
-            db->stmt("SELECT completedAt - startedAt FROM builds WHERE name = ? ORDER BY completedAt DESC LIMIT 1")
-             .bind(run->name)
-             .fetch<uint>([&](uint etc){
+            tx.exec_params("SELECT completedAt - startedAt FROM builds WHERE name = $1 ORDER BY completedAt DESC LIMIT 1",
+                           run->name)
+            .for_each([&](uint etc){
                 j.set("etc", time(nullptr) + etc);
             });
             j.EndObject();
@@ -768,9 +761,9 @@ void Laminar::handleRunFinished(Run * r) {
         }
     }
 
-    db->stmt("UPDATE builds SET completedAt = ?, result = ?, output = ?, outputLen = ? WHERE name = ? AND number = ?")
-     .bind(completedAt, int(r->result), maybeZipped, logsize, r->name, r->build)
-     .exec();
+    pqxx::nontransaction tx(*conn);
+    tx.exec_params("UPDATE builds SET completedAt = $1, result = $2, output = $3, outputLen = $4 WHERE name = $5 AND number = $6",
+                   completedAt, int(r->result), pqxx::binary_cast(maybeZipped), logsize, r->name, r->build);
 
     // notify clients
     Json j;
@@ -833,9 +826,10 @@ kj::Maybe<kj::Own<const kj::ReadableFile>> Laminar::getArtefact(std::string path
 
 bool Laminar::handleBadgeRequest(std::string job, std::string &badge) {
     RunState rs = RunState::UNKNOWN;
-    db->stmt("SELECT result FROM builds WHERE name = ? AND result IS NOT NULL ORDER BY number DESC LIMIT 1")
-            .bind(job)
-            .fetch<int>([&](int result){
+    pqxx::nontransaction tx(*conn);
+    tx.exec_params("SELECT result FROM builds WHERE name = $1 AND result IS NOT NULL ORDER BY number DESC LIMIT 1",
+                   job)
+    .for_each([&](int result){
         rs = RunState(result);
     });
     if(rs == RunState::UNKNOWN)
