@@ -133,7 +133,6 @@ generate_compressed_bins(${CMAKE_BINARY_DIR} js/vue.min.js
 
 set(LAMINARD_CORE_SOURCES
     src/conf.cpp
-    src/database.cpp
     src/laminar.cpp
     src/leader.cpp
     src/http.cpp
@@ -161,7 +160,7 @@ include_directories(${Threads_INCLUDE_DIRS})
 ## Server
 add_executable(laminard ${LAMINARD_CORE_SOURCES} src/main.cpp ${COMPRESSED_BINS})
 target_link_libraries(laminard CapnProto::capnp-rpc CapnProto::capnp CapnProto::kj-http CapnProto::kj-async 
-                               CapnProto::kj Threads::Threads SQLite::SQLite3 ZLIB::ZLIB)
+                               CapnProto::kj Threads::Threads pqxx ZLIB::ZLIB)
 
 if (${CMAKE_SYSTEM_NAME} STREQUAL "FreeBSD")
     pkg_check_modules(INOTIFY REQUIRED libinotify)
@@ -190,8 +189,8 @@ set(BUILD_TESTS FALSE CACHE BOOL "Build tests")
 if(BUILD_TESTS)
     find_package(GTest REQUIRED)
     include_directories(${GTEST_INCLUDE_DIRS} src)
-    add_executable(laminar-tests ${LAMINARD_CORE_SOURCES} ${COMPRESSED_BINS} test/main.cpp test/laminar-functional.cpp test/unit-conf.cpp test/unit-database.cpp)
-    target_link_libraries(laminar-tests ${GTEST_LIBRARIES} capnp-rpc capnp kj-http kj-async kj pthread sqlite3 z)
+    add_executable(laminar-tests ${LAMINARD_CORE_SOURCES} ${COMPRESSED_BINS} test/main.cpp test/laminar-functional.cpp test/unit-conf.cpp)
+    target_link_libraries(laminar-tests ${GTEST_LIBRARIES} capnp-rpc capnp kj-http kj-async kj pqxx pthread z)
 endif()
 
 set(BASH_COMPLETIONS_DIR /usr/share/bash-completion/completions CACHE PATH "Path to bash completions directory")

@@ -92,6 +92,7 @@ int main(int argc, char** argv) {
     settings.bind_rpc = getenv("LAMINAR_BIND_RPC") ?: INTADDR_RPC_DEFAULT;
     settings.bind_http = getenv("LAMINAR_BIND_HTTP") ?: INTADDR_HTTP_DEFAULT;
     settings.archive_url = getenv("LAMINAR_ARCHIVE_URL") ?: ARCHIVE_URL_DEFAULT;
+    settings.connection_string = getenv("LAMINAR_CONNECTION_STRING") ?: "";
 
     server = new Server(ioContext);
     laminar = new Laminar(*server, settings);
