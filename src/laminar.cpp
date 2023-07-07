@@ -30,6 +30,7 @@
 #include <fcntl.h>
 #include <fnmatch.h>
 #include <fstream>
+#include <optional>
 #include <zlib.h>
 
 #define COMPRESS_LOG_MIN_SIZE 1024
@@ -244,20 +245,27 @@ std::string Laminar::getStatus(MonitorScope scope) {
     j.startObject("data");
     pqxx::nontransaction tx(*conn);
     if(scope.type == MonitorScope::RUN) {
-        tx.exec_params("SELECT queuedAt,startedAt,completedAt,result,reason,parentJob,parentBuild,q.lr IS NOT NULL,q.lr FROM builds "
+        tx.exec_params("SELECT queuedAt,startedAt,completedAt,result,reason,parentJob,parentBuild,q.lr FROM builds "
                        "LEFT JOIN (SELECT DISTINCT ON (name) name n, completedAt-startedAt lr FROM builds WHERE result IS NOT NULL ORDER BY name, number DESC) q ON q.n = name "
                        "WHERE name = $1 AND number = $2",
                        scope.job, scope.num)
-        .for_each([&](time_t queued, time_t started, time_t completed, int result, std::string reason, std::string parentJob, uint parentBuild, uint lastRuntimeKnown, uint lastRuntime) {
+        .for_each([&](time_t queued,
+                      std::optional<time_t> started,
+                      std::optional<time_t> completed,
+                      std::optional<int> result,
+                      std::optional<std::string> reason,
+                      std::optional<std::string> parentJob,
+                      uint parentBuild,
+                      std::optional<uint> lastRuntime) {
             j.set("queued", queued);
-            j.set("started", started);
+            j.set("started", started.value_or(0));
             if(completed)
-              j.set("completed", completed);
-            j.set("result", to_string(completed ? RunState(result) : started ? RunState::RUNNING : RunState::QUEUED));
-            j.set("reason", reason);
-            j.startObject("upstream").set("name", parentJob).set("num", parentBuild).EndObject(2);
-            if(lastRuntimeKnown)
-              j.set("etc", started + lastRuntime);
+              j.set("completed", *completed);
+            j.set("result", to_string(completed ? RunState(result.value_or(0)) : started ? RunState::RUNNING : RunState::QUEUED));
+            j.set("reason", reason.value_or(""));
+            j.startObject("upstream").set("name", parentJob.value_or("")).set("num", parentBuild).EndObject(2);
+            if(lastRuntime)
+              j.set("etc", started.value_or(0) + *lastRuntime);
         });
         if(auto it = buildNums.find(scope.job); it != buildNums.end())
             j.set("latestNum", int(it->second));
@@ -285,20 +293,20 @@ std::string Laminar::getStatus(MonitorScope scope) {
                 "WHERE name = $1 AND result IS NOT NULL ORDER BY "
                 + order_by + " LIMIT $2 OFFSET $3";
         tx.exec_params(stmt, scope.job, runsPerPage, scope.page * runsPerPage)
-        .for_each([&](uint build,time_t started,time_t completed,int result,str reason){
+        .for_each([&](uint build,time_t started,time_t completed,int result,std::optional<str> reason){
             j.StartObject();
             j.set("number", build)
              .set("completed", completed)
              .set("started", started)
              .set("result", to_string(RunState(result)))
-             .set("reason", reason)
+             .set("reason", reason.value_or(""))
              .EndObject();
         });
         j.EndArray();
         tx.exec_params("SELECT COUNT(*),CAST(AVG(completedAt-startedAt) AS INT) FROM builds WHERE name = $1 AND result IS NOT NULL",
                        scope.job)
-        .for_each([&](uint nRuns, uint averageRuntime){
-            j.set("averageRuntime", averageRuntime);
+        .for_each([&](uint nRuns, std::optional<uint> averageRuntime){
+            j.set("averageRuntime", averageRuntime.value_or(0));
             j.set("pages", (nRuns-1) / runsPerPage + 1);
             j.startObject("sort");
             j.set("page", scope.page)
@@ -353,14 +361,14 @@ std::string Laminar::getStatus(MonitorScope scope) {
         j.startArray("jobs");
         tx.exec("SELECT DISTINCT ON (name) name, number, startedAt, completedAt, result, reason "
                 "FROM builds ORDER BY name, number DESC")
-        .for_each([&](str name,uint number, time_t started, time_t completed, int result, str reason){
+        .for_each([&](str name,uint number, std::optional<time_t> started, std::optional<time_t> completed, std::optional<int> result, std::optional<str> reason){
             j.StartObject();
             j.set("name", name);
             j.set("number", number);
-            j.set("result", to_string(RunState(result)));
-            j.set("started", started);
-            j.set("completed", completed);
-            j.set("reason", reason);
+            j.set("result", to_string(RunState(result.value_or(0))));
+            j.set("started", started.value_or(0));
+            j.set("completed", completed.value_or(0));
+            j.set("reason", reason.value_or(""));
             j.EndObject();
         });
         j.EndArray();
@@ -381,16 +389,16 @@ std::string Laminar::getStatus(MonitorScope scope) {
     } else { // Home page
         j.startArray("recent");
         tx.exec("SELECT name,number,node,queuedAt,startedAt,completedAt,result,reason FROM builds WHERE completedAt IS NOT NULL ORDER BY completedAt DESC LIMIT 20")
-        .for_each([&](str name,uint build,str context,time_t queued,time_t started,time_t completed,int result,str reason){
+        .for_each([&](str name,uint build,std::optional<str> context,time_t queued,time_t started,time_t completed,int result,std::optional<str> reason){
             j.StartObject();
             j.set("name", name)
              .set("number", build)
-             .set("context", context)
+             .set("context", context.value_or(""))
              .set("queued", queued)
              .set("started", started)
              .set("completed", completed)
              .set("result", to_string(RunState(result)))
-             .set("reason", reason)
+             .set("reason", reason.value_or(""))
              .EndObject();
         });
         j.EndArray();
@@ -476,14 +484,14 @@ std::string Laminar::getStatus(MonitorScope scope) {
         j.EndArray();
         j.startArray("buildTimeChanges");
         tx.exec("SELECT name, STRING_AGG(CAST(number AS TEXT),','), STRING_AGG(CAST(completedAt-startedAt AS TEXT),',') FROM builds WHERE number > (SELECT MAX(number)-10 FROM builds b WHERE b.name=builds.name) GROUP BY name ORDER BY (MAX(completedAt-startedAt)-MIN(completedAt-startedAt))-STDDEV(completedAt-startedAt) DESC LIMIT 8")
-        .for_each([&](str name, str numbers, str durations){
+        .for_each([&](str name, str numbers, std::optional<str> durations){
             j.StartObject();
             j.set("name", name);
             j.startArray("numbers");
             j.RawValue(numbers.data(), numbers.length(), rapidjson::Type::kArrayType);
             j.EndArray();
             j.startArray("durations");
-            j.RawValue(durations.data(), durations.length(), rapidjson::Type::kArrayType);
+            j.RawValue(durations.value_or("").data(), durations.value_or("").length(), rapidjson::Type::kArrayType);
             j.EndArray();
             j.EndObject();
         });
@@ -676,8 +684,8 @@ bool Laminar::tryStartRun(std::shared_ptr<Run> run, int queueIndex) {
             // have completedAt == NULL and thus be at the end of a DESC ordered query
             tx.exec_params("SELECT result FROM builds WHERE name = $1 ORDER BY completedAt DESC LIMIT 1",
                            run->name)
-            .for_each([&](int result){
-                lastResult = RunState(result);
+            .for_each([&](std::optional<int> result){
+                lastResult = RunState(result.value_or(0));
             });
 
             kj::Promise<RunState> onRunFinished = run->start(lastResult, ctx, *fsHome,[this](kj::Maybe<pid_t>& pid){return srv.onChildExit(pid);});
@@ -718,8 +726,8 @@ bool Laminar::tryStartRun(std::shared_ptr<Run> run, int queueIndex) {
              .set("reason", run->reason());
             tx.exec_params("SELECT completedAt - startedAt FROM builds WHERE name = $1 ORDER BY completedAt DESC LIMIT 1",
                            run->name)
-            .for_each([&](uint etc){
-                j.set("etc", time(nullptr) + etc);
+            .for_each([&](std::optional<uint> etc){
+                j.set("etc", time(nullptr) + etc.value_or(0));
             });
             j.EndObject();
             http->notifyEvent(j.str(), run->name.c_str());
