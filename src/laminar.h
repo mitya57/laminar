@@ -124,6 +124,7 @@ private:
 
     RunSet activeJobs;
     pqxx::connection *conn;
+    pqxx::nontransaction *tx;
     Server& srv;
     ContextMap contexts;
     kj::Path homePath;
