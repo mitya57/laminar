@@ -31,9 +31,6 @@
 #include <fnmatch.h>
 #include <fstream>
 #include <optional>
-#include <zlib.h>
-
-#define COMPRESS_LOG_MIN_SIZE 1024
 
 #include <rapidjson/stringbuffer.h>
 #include <rapidjson/writer.h>
@@ -164,21 +161,11 @@ bool Laminar::handleLogRequest(std::string name, uint num, std::string& output, 
         complete = false;
         return true;
     } else { // it must be finished, fetch it from the database
-        tx->exec_params("SELECT output, outputLen FROM builds WHERE name = $1 AND number = $2",
+        tx->exec_params("SELECT output FROM builds WHERE name = $1 AND number = $2",
                         name, num)
-        .for_each([&](std::basic_string<std::byte> maybeZipped, unsigned long sz) {
-            str log(sz,'\0');
-            if(sz >= COMPRESS_LOG_MIN_SIZE) {
-                int res = ::uncompress((uint8_t*) log.data(), &sz,
-                                       (const uint8_t*) maybeZipped.data(), maybeZipped.size());
-                if(res == Z_OK)
-                    std::swap(output, log);
-                else
-                    LLOG(ERROR, "Failed to uncompress log", res);
-            } else {
-                // TODO: Can we avoid a copy here?
-                output = str(reinterpret_cast<const char*>(maybeZipped.c_str()));
-            }
+        .for_each([&](std::basic_string<std::byte> maybeZipped) {
+            // TODO: Can we avoid a copy here?
+            output = str(reinterpret_cast<const char*>(maybeZipped.c_str()));
         });
         if(output.size()) {
             complete = true;
@@ -753,21 +740,8 @@ void Laminar::handleRunFinished(Run * r) {
     LLOG(INFO, "Run completed", r->name, to_string(r->result));
     time_t completedAt = time(nullptr);
 
-    // compress log
-    std::string maybeZipped = r->log;
-    size_t logsize = r->log.length();
-    if(r->log.length() >= COMPRESS_LOG_MIN_SIZE) {
-        std::string zipped(r->log.size(), '\0');
-        unsigned long zippedSize = zipped.size();
-        if(::compress((uint8_t*) zipped.data(), &zippedSize,
-            (const uint8_t*) r->log.data(), logsize) == Z_OK) {
-            zipped.resize(zippedSize);
-            std::swap(maybeZipped, zipped);
-        }
-    }
-
     tx->exec_params("UPDATE builds SET completedAt = $1, result = $2, output = $3, outputLen = $4 WHERE name = $5 AND number = $6",
-                    completedAt, int(r->result), pqxx::binary_cast(maybeZipped), logsize, r->name, r->build);
+                    completedAt, int(r->result), pqxx::binary_cast(r->log), r->log.length(), r->name, r->build);
 
     // notify clients
     Json j;
