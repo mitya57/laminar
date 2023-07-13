@@ -112,6 +112,17 @@ Laminar::Laminar(Server &server, Settings settings) :
     tx->exec("CREATE INDEX IF NOT EXISTS idx_completion_time ON builds("
              "completedAt DESC)");
 
+    tx->exec("CREATE MATERIALIZED VIEW IF NOT EXISTS build_time_changes AS "
+             "SELECT names.name"
+             "     , STRING_AGG(CAST(number AS TEXT),',') AS numbers"
+             "     , STRING_AGG(CAST(diff AS TEXT),',') AS durations "
+             "FROM (SELECT DISTINCT name FROM builds) AS names "
+             "JOIN LATERAL (SELECT builds.name, number, completedAt-startedAt AS diff"
+             "              FROM builds WHERE builds.name = names.name"
+             "              ORDER BY number DESC LIMIT 10"
+             "             ) AS builds_last10 ON true "
+             "GROUP BY names.name "
+             "ORDER BY (MAX(diff)-MIN(diff))-STDDEV(diff) DESC LIMIT 8");
     // retrieve the last build numbers
     tx->exec("SELECT name, MAX(number) FROM builds GROUP BY name")
     .for_each([this](str name, uint build){
@@ -468,7 +479,7 @@ std::string Laminar::getStatus(MonitorScope scope) {
         });
         j.EndArray();
         j.startArray("buildTimeChanges");
-        tx->exec("SELECT name, STRING_AGG(CAST(number AS TEXT),','), STRING_AGG(CAST(completedAt-startedAt AS TEXT),',') FROM builds WHERE number > (SELECT MAX(number)-10 FROM builds b WHERE b.name=builds.name) GROUP BY name ORDER BY (MAX(completedAt-startedAt)-MIN(completedAt-startedAt))-STDDEV(completedAt-startedAt) DESC LIMIT 8")
+        tx->exec("SELECT name, numbers, durations FROM build_time_changes")
         .for_each([&](str name, str numbers, std::optional<str> durations){
             j.StartObject();
             j.set("name", name);
@@ -742,6 +753,7 @@ void Laminar::handleRunFinished(Run * r) {
 
     tx->exec_params("UPDATE builds SET completedAt = $1, result = $2, output = $3, outputLen = $4 WHERE name = $5 AND number = $6",
                     completedAt, int(r->result), pqxx::binary_cast(r->log), r->log.length(), r->name, r->build);
+    tx->exec("REFRESH MATERIALIZED VIEW buildTimeChanges");
 
     // notify clients
     Json j;
