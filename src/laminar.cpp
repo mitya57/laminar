@@ -150,6 +150,16 @@ Laminar::Laminar(Server &server, Settings settings) :
         LIMIT 8
     )sql");
 
+    tx->exec(R"sql(
+        CREATE MATERIALIZED VIEW IF NOT EXISTS builds_per_day AS
+        SELECT result
+             , CAST(EXTRACT('epoch' FROM NOW()) AS BIGINT)/86400 - completedAt/86400 AS day
+             , COUNT(*) AS cnt
+        FROM builds
+        WHERE CAST(EXTRACT('epoch' FROM NOW()) AS BIGINT)/86400 - completedAt/86400 <= 6
+        GROUP BY 1, 2
+    )sql");
+
     // retrieve the last build numbers
     tx->exec("SELECT name, MAX(number) FROM builds GROUP BY name")
     .for_each([this](str name, uint build){
@@ -486,8 +496,7 @@ std::string Laminar::getStatus(MonitorScope scope) {
         j.startArray("buildsPerDay");
         for(int i = 6; i >= 0; --i) {
             j.StartObject();
-            tx->exec_params("SELECT result, COUNT(*) FROM builds WHERE completedAt > $1 AND completedAt < $2 GROUP BY result",
-                    86400*(time(nullptr)/86400 - i), 86400*(time(nullptr)/86400 - (i-1)))
+            tx->exec_params("SELECT result, cnt FROM builds_per_day WHERE day = $1", i)
             .for_each([&](int result, int num){
                 j.set(to_string(RunState(result)).c_str(), num);
             });
@@ -804,6 +813,7 @@ void Laminar::handleRunFinished(Run * r) {
     tx->exec_params("UPDATE builds SET completedAt = $1, result = $2, output = $3, outputLen = $4 WHERE name = $5 AND number = $6",
                     completedAt, int(r->result), pqxx::binary_cast(r->log), r->log.length(), r->name, r->build);
     tx->exec("REFRESH MATERIALIZED VIEW build_time_changes");
+    tx->exec("REFRESH MATERIALIZED VIEW builds_per_day");
 
     // notify clients
     Json j;
