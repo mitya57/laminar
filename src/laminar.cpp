@@ -97,32 +97,48 @@ Laminar::Laminar(Server &server, Settings settings) :
     // TODO: error handling
     tx->exec("CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\"");
 
-    tx->exec("CREATE TABLE IF NOT EXISTS builds("
-             // Fixed-width columns come first
-             "guid UUID DEFAULT uuid_generate_v4(), number BIGINT NOT NULL, "
-             "queuedAt BIGINT NOT NULL, startedAt BIGINT, completedAt BIGINT, "
-             "result INT, outputLen BIGINT, parentBuild BIGINT, "
-             // And then text/bytea fields
-             "name TEXT NOT NULL, node TEXT, output BYTEA, parentJob TEXT, "
-             "reason TEXT, PRIMARY KEY (guid))");
+    tx->exec(R"sql(
+        CREATE TABLE IF NOT EXISTS builds
+          ( guid        UUID   DEFAULT uuid_generate_v4() PRIMARY KEY
+          , number      BIGINT NOT NULL
+          , queuedAt    BIGINT NOT NULL
+          , startedAt   BIGINT
+          , completedAt BIGINT
+          , result      INT
+          , outputLen   BIGINT
+          , parentBuild BIGINT
+          , name        TEXT   NOT NULL
+          , output      BYTEA
+          , parentJob   TEXT
+          , reason      TEXT
+          )
+    )sql");
 
-    tx->exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_name_number ON builds("
-             "name, number DESC)");
+    tx->exec(R"sql(
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_name_number ON builds
+          (name, number DESC)
+    )sql");
 
-    tx->exec("CREATE INDEX IF NOT EXISTS idx_completion_time ON builds("
-             "completedAt DESC)");
+    tx->exec(R"sql(
+        CREATE INDEX IF NOT EXISTS idx_completion_time ON builds
+          (completedAt DESC)
+    )sql");
 
-    tx->exec("CREATE MATERIALIZED VIEW IF NOT EXISTS build_time_changes AS "
-             "SELECT names.name"
-             "     , STRING_AGG(CAST(number AS TEXT),',') AS numbers"
-             "     , STRING_AGG(CAST(diff AS TEXT),',') AS durations "
-             "FROM (SELECT DISTINCT name FROM builds) AS names "
-             "JOIN LATERAL (SELECT builds.name, number, completedAt-startedAt AS diff"
-             "              FROM builds WHERE builds.name = names.name"
-             "              ORDER BY number DESC LIMIT 10"
-             "             ) AS builds_last10 ON true "
-             "GROUP BY names.name "
-             "ORDER BY (MAX(diff)-MIN(diff))-STDDEV(diff) DESC LIMIT 8");
+    tx->exec(R"sql(
+        CREATE MATERIALIZED VIEW IF NOT EXISTS build_time_changes AS
+        SELECT names.name
+             , STRING_AGG(CAST(number AS TEXT), ',') AS numbers
+             , STRING_AGG(CAST(diff AS TEXT), ',') AS durations
+        FROM (SELECT DISTINCT name FROM builds) AS names
+        JOIN LATERAL (SELECT builds.name, number, completedAt-startedAt AS diff
+                      FROM builds WHERE builds.name = names.name
+                      ORDER BY number DESC LIMIT 10
+                     ) AS builds_last10 ON true
+        GROUP BY names.name
+        ORDER BY (MAX(diff)-MIN(diff))-STDDEV(diff) DESC
+        LIMIT 8
+    )sql");
+
     // retrieve the last build numbers
     tx->exec("SELECT name, MAX(number) FROM builds GROUP BY name")
     .for_each([this](str name, uint build){
