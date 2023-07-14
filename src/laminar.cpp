@@ -160,6 +160,16 @@ Laminar::Laminar(Server &server, Settings settings) :
         GROUP BY 1, 2
     )sql");
 
+    tx->exec(R"sql(
+        CREATE MATERIALIZED VIEW IF NOT EXISTS low_pass_rates AS
+        SELECT name
+             , CAST(COUNT(1) FILTER (WHERE result=5) AS FLOAT)/COUNT(*) AS pass_rate
+        FROM builds
+        GROUP BY name
+        ORDER BY pass_rate ASC
+        LIMIT 8
+    )sql");
+
     // retrieve the last build numbers
     tx->exec("SELECT name, MAX(number) FROM builds GROUP BY name")
     .for_each([this](str name, uint build){
@@ -529,8 +539,7 @@ std::string Laminar::getStatus(MonitorScope scope) {
         });
         j.EndArray();
         j.startArray("lowPassRates");
-        tx->exec_params("SELECT name,CAST(COUNT(1) FILTER (WHERE result=$1) AS FLOAT)/COUNT(*) AS passRate FROM builds GROUP BY name ORDER BY passRate ASC LIMIT 8",
-                        int(RunState::SUCCESS))
+        tx->exec("SELECT name, pass_rate FROM low_pass_rates")
         .for_each([&](str job, double passRate){
             j.StartObject();
             j.set("name", job).set("passRate", passRate);
@@ -814,6 +823,7 @@ void Laminar::handleRunFinished(Run * r) {
                     completedAt, int(r->result), pqxx::binary_cast(r->log), r->log.length(), r->name, r->build);
     tx->exec("REFRESH MATERIALIZED VIEW build_time_changes");
     tx->exec("REFRESH MATERIALIZED VIEW builds_per_day");
+    tx->exec("REFRESH MATERIALIZED VIEW low_pass_rates");
 
     // notify clients
     Json j;
