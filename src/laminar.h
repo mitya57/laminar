@@ -105,7 +105,7 @@ private:
     bool tryStartRun(std::shared_ptr<Run> run, int queueIndex);
     void handleRunFinished(Run*);
     // expects that Json has started an array
-    void populateArtifacts(Json& out, std::string job, uint num, kj::Path subdir = kj::Path::parse(".")) const;
+    void populateArtifacts(Json& out, std::string job, uint num, pqxx::stream_to *stream = nullptr, kj::Path subdir = kj::Path::parse(".")) const;
 
     Run* activeRun(const std::string name, uint num) {
         auto it = activeJobs.byNameNumber().find(boost::make_tuple(name, num));
