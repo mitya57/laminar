@@ -115,6 +115,17 @@ Laminar::Laminar(Server &server, Settings settings) :
     )sql");
 
     tx->exec(R"sql(
+        CREATE TABLE IF NOT EXISTS artifacts
+          ( guid        UUID   DEFAULT uuid_generate_v4() PRIMARY KEY
+          , number      BIGINT NOT NULL
+          , filesize    BIGINT NOT NULL
+          , name        TEXT   NOT NULL
+          , filename    TEXT   NOT NULL
+          , CONSTRAINT fk_name_number FOREIGN KEY (name, number) REFERENCES builds(name, number)
+          )
+    )sql");
+
+    tx->exec(R"sql(
         CREATE UNIQUE INDEX IF NOT EXISTS idx_name_number ON builds
           (name, number DESC)
     )sql");
@@ -230,7 +241,7 @@ std::list<std::string> Laminar::listKnownJobs() {
     return res;
 }
 
-void Laminar::populateArtifacts(Json &j, std::string job, uint num, kj::Path subdir) const {
+void Laminar::populateArtifacts(Json &j, std::string job, uint num, pqxx::stream_to *stream, kj::Path subdir) const {
     kj::Path runArchive{job,std::to_string(num)};
     runArchive = runArchive.append(subdir);
     KJ_IF_MAYBE(dir, fsHome->tryOpenSubdir("archive"/runArchive)) {
@@ -242,11 +253,28 @@ void Laminar::populateArtifacts(Json &j, std::string job, uint num, kj::Path sub
                 j.set("filename", (subdir/file).toString().cStr());
                 j.set("size", meta.size);
                 j.EndObject();
+                if (stream != nullptr) {
+                    std::tuple<str, uint, str, uint> row{job, num, (subdir/file).toString().cStr(), meta.size};
+                    *stream << row;
+                }
             } else if(meta.type == kj::FsNode::Type::DIRECTORY) {
-                populateArtifacts(j, job, num, subdir/file);
+                populateArtifacts(j, job, num, stream, subdir/file);
             }
         }
     }
+}
+
+void Laminar::populateArtifactsFromDB(Json &j, std::string job, uint num) const {
+    kj::Path runArchive{job,std::to_string(num)};
+    tx->exec_params("SELECT filename, filesize FROM artifacts WHERE name = $1 AND number = $2",
+                    job, num)
+    .for_each([&](str fileName, uint fileSize) {
+        j.StartObject();
+        j.set("url", archiveUrl + (runArchive/fileName).toString().cStr());
+        j.set("filename", fileName);
+        j.set("size", fileSize);
+        j.EndObject();
+    });
 }
 
 std::string Laminar::getStatus(MonitorScope scope) {
@@ -257,6 +285,7 @@ std::string Laminar::getStatus(MonitorScope scope) {
     j.set("time", time(nullptr));
     j.startObject("data");
     if(scope.type == MonitorScope::RUN) {
+        bool isCompleted = false;
         tx->exec_params("SELECT queuedAt,startedAt,completedAt,result,reason,parentJob,parentBuild,q.lr FROM builds "
                         "LEFT JOIN (SELECT DISTINCT ON (name) name n, completedAt-startedAt lr FROM builds WHERE result IS NOT NULL ORDER BY name, number DESC) q ON q.n = name "
                         "WHERE name = $1 AND number = $2",
@@ -271,8 +300,10 @@ std::string Laminar::getStatus(MonitorScope scope) {
                       std::optional<uint> lastRuntime) {
             j.set("queued", queued);
             j.set("started", started.value_or(0));
-            if(completed)
+            if(completed) {
               j.set("completed", *completed);
+              isCompleted = true;
+            }
             j.set("result", to_string(completed ? RunState(result.value_or(0)) : started ? RunState::RUNNING : RunState::QUEUED));
             j.set("reason", reason.value_or(""));
             j.startObject("upstream").set("name", parentJob.value_or("")).set("num", parentBuild).EndObject(2);
@@ -283,7 +314,10 @@ std::string Laminar::getStatus(MonitorScope scope) {
             j.set("latestNum", int(it->second));
 
         j.startArray("artifacts");
-        populateArtifacts(j, scope.job, scope.num);
+        if (isCompleted)
+            populateArtifactsFromDB(j, scope.job, scope.num);
+        else
+            populateArtifacts(j, scope.job, scope.num);
         j.EndArray();
     } else if(scope.type == MonitorScope::JOB) {
         const uint runsPerPage = 20;
@@ -783,7 +817,9 @@ void Laminar::handleRunFinished(Run * r) {
             .set("result", to_string(r->result))
             .set("reason", r->reason());
     j.startArray("artifacts");
-    populateArtifacts(j, r->name, r->build);
+    auto stream = pqxx::stream_to::table(*tx, {"artifacts"}, {"name", "number", "filename", "filesize"});
+    populateArtifacts(j, r->name, r->build, &stream);
+    stream.complete();
     j.EndArray();
     j.EndObject();
     http->notifyEvent(j.str(), r->name);
