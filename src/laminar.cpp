@@ -136,6 +136,12 @@ Laminar::Laminar(Server &server, Settings settings) :
     )sql");
 
     tx->exec(R"sql(
+        CREATE INDEX IF NOT EXISTS idx_completed ON builds
+          (name)
+        WHERE result IS NOT NULL
+    )sql");
+
+    tx->exec(R"sql(
         CREATE MATERIALIZED VIEW IF NOT EXISTS build_time_changes AS
         SELECT names.name
              , STRING_AGG(CAST(number AS TEXT), ',') AS numbers
