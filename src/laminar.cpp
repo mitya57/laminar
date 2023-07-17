@@ -176,6 +176,17 @@ Laminar::Laminar(Server &server, Settings settings) :
         LIMIT 8
     )sql");
 
+    tx->exec(R"sql(
+        CREATE MATERIALIZED VIEW IF NOT EXISTS time_per_job AS
+        SELECT name
+             , AVG(completedAt-startedAt) AS av
+        FROM builds
+        WHERE completedAt > EXTRACT('epoch' FROM NOW()) - 7 * 86400
+        GROUP BY name
+        ORDER BY av DESC
+        LIMIT 8
+    )sql");
+
     // retrieve the last build numbers
     tx->exec("SELECT name, MAX(number) FROM builds GROUP BY name")
     .for_each([this](str name, uint build){
@@ -527,8 +538,7 @@ std::string Laminar::getStatus(MonitorScope scope) {
         });
         j.EndObject();
         j.startObject("timePerJob");
-        tx->exec_params("SELECT name, AVG(completedAt-startedAt) av FROM builds WHERE completedAt > $1 GROUP BY name ORDER BY av DESC LIMIT 8",
-                        time(nullptr) - 7 * 86400)
+        tx->exec("SELECT name, av FROM time_per_job")
         .for_each([&](str job, double time){
             j.set(job.c_str(), time);
         });
@@ -830,6 +840,7 @@ void Laminar::handleRunFinished(Run * r) {
     tx->exec("REFRESH MATERIALIZED VIEW build_time_changes");
     tx->exec("REFRESH MATERIALIZED VIEW builds_per_day");
     tx->exec("REFRESH MATERIALIZED VIEW low_pass_rates");
+    tx->exec("REFRESH MATERIALIZED VIEW time_per_job");
 
     // notify clients
     Json j;
