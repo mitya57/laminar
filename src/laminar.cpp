@@ -123,6 +123,12 @@ Laminar::Laminar(Server &server, Settings settings) :
     )sql");
 
     tx->exec(R"sql(
+        CREATE INDEX IF NOT EXISTS idx_completed ON builds
+          (name)
+        WHERE result IS NOT NULL
+    )sql");
+
+    tx->exec(R"sql(
         CREATE TABLE IF NOT EXISTS artifacts
           ( guid        UUID   DEFAULT gen_random_uuid() PRIMARY KEY
           , number      BIGINT NOT NULL
