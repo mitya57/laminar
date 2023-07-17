@@ -187,6 +187,23 @@ Laminar::Laminar(Server &server, Settings settings) :
         LIMIT 8
     )sql");
 
+    tx->exec(R"sql(
+        CREATE MATERIALIZED VIEW IF NOT EXISTS result_changed AS
+        WITH stats AS (
+            SELECT name
+                 , MAX(number) FILTER (WHERE result = 5) AS last_success
+                 , MAX(number) FILTER (WHERE result <> 5) AS last_failure
+            FROM builds
+            GROUP BY name
+        )
+        SELECT name, last_success, last_failure
+        FROM stats
+        WHERE last_success IS NOT NULL
+        AND last_failure IS NOT NULL
+        ORDER BY last_success - last_failure
+        LIMIT 8
+    )sql");
+
     // retrieve the last build numbers
     tx->exec("SELECT name, MAX(number) FROM builds GROUP BY name")
     .for_each([this](str name, uint build){
@@ -544,8 +561,7 @@ std::string Laminar::getStatus(MonitorScope scope) {
         });
         j.EndObject();
         j.startArray("resultChanged");
-        tx->exec_params("SELECT b.name,MAX(b.number) as lastSuccess,lastFailure FROM builds AS b JOIN (SELECT name,MAX(number) AS lastFailure FROM builds WHERE result<>$1 GROUP BY name) AS t ON t.name=b.name WHERE b.result=$2 GROUP BY b.name, lastFailure ORDER BY MAX(b.number)>lastFailure, lastFailure-MAX(b.number) DESC LIMIT 8",
-                        int(RunState::SUCCESS), int(RunState::SUCCESS))
+        tx->exec("SELECT name, last_success, last_failure FROM result_changed")
         .for_each([&](str job, uint lastSuccess, uint lastFailure){
             j.StartObject();
             j.set("name", job)
@@ -841,6 +857,7 @@ void Laminar::handleRunFinished(Run * r) {
     tx->exec("REFRESH MATERIALIZED VIEW builds_per_day");
     tx->exec("REFRESH MATERIALIZED VIEW low_pass_rates");
     tx->exec("REFRESH MATERIALIZED VIEW time_per_job");
+    tx->exec("REFRESH MATERIALIZED VIEW result_changed");
 
     // notify clients
     Json j;
