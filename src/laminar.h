@@ -124,8 +124,7 @@ private:
     std::unordered_map<std::string, std::string> jobGroups;
 
     RunSet activeJobs;
-    pqxx::connection *conn;
-    pqxx::nontransaction *tx;
+    Settings settings;
     Server& srv;
     ContextMap contexts;
     kj::Path homePath;

@@ -70,7 +70,28 @@ inline kj::Path operator/(const std::string& p, const T& ext) {
 
 typedef std::string str;
 
+class temp_transaction {
+private:
+    pqxx::connection conn;
+    pqxx::nontransaction tx;
+
+public:
+    temp_transaction(const char *connection_string) :
+        conn(connection_string),
+        tx(conn)
+    { }
+
+    pqxx::nontransaction *operator->() {
+        return &tx;
+    }
+
+    pqxx::nontransaction &ref() {
+        return tx;
+    }
+};
+
 Laminar::Laminar(Server &server, Settings settings) :
+    settings(settings),
     srv(server),
     homePath(kj::Path::parse(&settings.home[1])),
     fsHome(kj::newDiskFilesystem()->getRoot().openSubdir(homePath, kj::WriteMode::MODIFY)),
@@ -90,8 +111,7 @@ Laminar::Laminar(Server &server, Settings settings) :
 
     numKeepRunDirs = 0;
 
-    conn = new pqxx::connection(settings.connection_string);
-    tx = new pqxx::nontransaction(*conn);
+    temp_transaction tx(settings.connection_string);
 
     // Prepare database for first use
     // TODO: error handling
@@ -269,6 +289,7 @@ bool Laminar::handleLogRequest(std::string name, uint num, std::string& output, 
         complete = false;
         return true;
     } else { // it must be finished, fetch it from the database
+        temp_transaction tx(settings.connection_string);
         tx->exec_params("SELECT output FROM builds WHERE name = $1 AND number = $2",
                         name, num)
         .for_each([&](std::basic_string<std::byte> maybeZipped) {
@@ -336,6 +357,7 @@ void Laminar::populateArtifacts(Json &j, std::string job, uint num, pqxx::stream
 
 void Laminar::populateArtifactsFromDB(Json &j, std::string job, uint num) const {
     kj::Path runArchive{job,std::to_string(num)};
+    temp_transaction tx(settings.connection_string);
     tx->exec_params("SELECT filename, filesize FROM artifacts WHERE name = $1 AND number = $2",
                     job, num)
     .for_each([&](str fileName, uint fileSize) {
@@ -348,6 +370,7 @@ void Laminar::populateArtifactsFromDB(Json &j, std::string job, uint num) const 
 }
 
 std::string Laminar::getStatus(MonitorScope scope) {
+    temp_transaction tx(settings.connection_string);
     Json j;
     j.set("type", "status");
     j.set("title", getenv("LAMINAR_TITLE") ?: "Laminar");
@@ -618,13 +641,7 @@ std::string Laminar::getStatus(MonitorScope scope) {
     return j.str();
 }
 
-Laminar::~Laminar() noexcept try {
-    delete tx;
-    delete conn;
-} catch (std::exception& e) {
-    LLOG(ERROR, e.what());
-    return;
-}
+Laminar::~Laminar() noexcept { }
 
 bool Laminar::loadConfiguration() {
     if(const char* ndirs = getenv("LAMINAR_KEEP_RUNDIRS"))
@@ -733,6 +750,7 @@ std::shared_ptr<Run> Laminar::queueJob(std::string name, ParamMap params, bool f
     else
         queuedJobs.push_back(run);
 
+    temp_transaction tx(settings.connection_string);
     tx->exec_params("INSERT INTO builds(name,number,queuedAt,parentJob,parentBuild,reason) VALUES($1,$2,$3,$4,$5,$6)",
                     run->name, run->build, run->queuedAt, run->parentName, run->parentBuild, run->reason());
 
@@ -792,6 +810,7 @@ bool Laminar::tryStartRun(std::shared_ptr<Run> run, int queueIndex) {
 
             // set the last known result if exists. Runs which haven't started yet should
             // have completedAt == NULL and thus be at the end of a DESC ordered query
+            temp_transaction tx(settings.connection_string);
             tx->exec_params("SELECT result FROM builds WHERE name = $1 ORDER BY completedAt DESC LIMIT 1",
                             run->name)
             .for_each([&](std::optional<int> result){
@@ -866,6 +885,7 @@ void Laminar::handleRunFinished(Run * r) {
     LLOG(INFO, "Run completed", r->name, to_string(r->result));
     time_t completedAt = time(nullptr);
 
+    temp_transaction tx(settings.connection_string);
     tx->exec_params("UPDATE builds SET completedAt = $1, result = $2, output = $3, outputLen = $4 WHERE name = $5 AND number = $6",
                     completedAt, int(r->result), pqxx::binary_cast(r->log), r->log.length(), r->name, r->build);
     tx->exec("REFRESH MATERIALIZED VIEW build_time_changes");
@@ -887,7 +907,7 @@ void Laminar::handleRunFinished(Run * r) {
             .set("result", to_string(r->result))
             .set("reason", r->reason());
     j.startArray("artifacts");
-    auto stream = pqxx::stream_to::table(*tx, {"artifacts"}, {"name", "number", "filename", "filesize"});
+    auto stream = pqxx::stream_to::table(tx.ref(), {"artifacts"}, {"name", "number", "filename", "filesize"});
     populateArtifacts(j, r->name, r->build, &stream);
     stream.complete();
     j.EndArray();
@@ -938,6 +958,7 @@ kj::Maybe<kj::Own<const kj::ReadableFile>> Laminar::getArtefact(std::string path
 
 bool Laminar::handleBadgeRequest(std::string job, std::string &badge) {
     RunState rs = RunState::UNKNOWN;
+    temp_transaction tx(settings.connection_string);
     tx->exec_params("SELECT result FROM builds WHERE name = $1 AND result IS NOT NULL ORDER BY number DESC LIMIT 1",
                     job)
     .for_each([&](int result){
