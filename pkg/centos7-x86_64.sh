@@ -6,7 +6,8 @@ SOURCE_DIR=$(readlink -f $(dirname ${BASH_SOURCE[0]})/..)
 
 VERSION=$(cd "$SOURCE_DIR" && git describe --tags --abbrev=8 --dirty | tr - .)~upstream_centos7
 
-DOCKER_TAG=$(docker build -q - <<EOS
+DOCKER_TAG=$(
+	docker build -q - <<EOS
 FROM centos:7
 RUN yum -y install epel-release centos-release-scl && yum-config-manager --enable rhel-server-rhscl-7-rpms && yum -y install rpm-build cmake3 make devtoolset-7-gcc-c++ wget sqlite-devel boost-devel zlib-devel
 EOS

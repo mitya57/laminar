@@ -6,7 +6,8 @@ SOURCE_DIR=$(readlink -f $(dirname ${BASH_SOURCE[0]})/..)
 
 VERSION=$(cd "$SOURCE_DIR" && git describe --tags --abbrev=8 --dirty | tr - .)~upstream_suse_leap_15.6
 
-DOCKER_TAG=$(docker build -q - <<EOS
+DOCKER_TAG=$(
+	docker build -q - <<EOS
 FROM opensuse/leap:latest
 RUN zypper --non-interactive refresh && zypper --non-interactive update && zypper --non-interactive install -y rpm-build cmake make gcc-c++ wget sqlite3-devel boost-devel zlib-devel capnproto libcapnp-devel rapidjson-devel
 EOS
