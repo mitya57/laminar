@@ -146,6 +146,7 @@ kj::Promise<RunState> Run::start(RunState lastResult, std::shared_ptr<Context> c
         setenv("LAST_RESULT", to_string(lastResult).c_str(), true);
         setenv("WORKSPACE", (rootPath/"run"/name/"workspace").toString(true).cStr(), true);
         setenv("ARCHIVE", (rootPath/"archive"/name/runNumStr).toString(true).cStr(), true);
+        setenv("REASON", reason().c_str(), true);
         // RESULT set in leader process
 
         // leader process assumes $LAMINAR_HOME as CWD
